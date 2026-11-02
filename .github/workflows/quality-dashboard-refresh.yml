@@ -72,9 +72,38 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch -c "$REFRESH_BRANCH"
           git add docs/assets/quality-dashboard-sources.json docs/en/quality-dashboard.md docs/ja/quality-dashboard.md
-          if git diff --cached --quiet; then exit 0; fi
+          if git diff --cached --quiet; then
+            echo "No dashboard changes; evidence is available in this run artifact." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           git commit -m 'docs: refresh quality dashboard evidence (#298)'
+          pushed=false
+          retained=false
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ "$pushed" = true ] && [ "$retained" = false ]; then
+              if prs="$(gh pr list --state all --head "$REFRESH_BRANCH" --json number --jq 'length' --limit 1)"; then
+                if [ "$prs" = "0" ]; then
+                  if git push origin --delete "$REFRESH_BRANCH"; then
+                    echo "Removed orphan branch $REFRESH_BRANCH." >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "::error::Manual cleanup required for branch $REFRESH_BRANCH; branch deletion failed."
+                    echo "Manual cleanup required for branch $REFRESH_BRANCH; branch deletion failed." >> "$GITHUB_STEP_SUMMARY"
+                  fi
+                else
+                  echo "Preserved branch $REFRESH_BRANCH: it already has a PR or the lookup was inconclusive." >> "$GITHUB_STEP_SUMMARY"
+                fi
+              else
+                echo "::error::Branch cleanup could not be safely completed for $REFRESH_BRANCH: PR lookup failed."
+                echo "Branch cleanup could not be safely completed for $REFRESH_BRANCH: PR lookup failed; branch preserved." >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
           git push origin "$REFRESH_BRANCH"
+          pushed=true
           cat > "$RUNNER_TEMP/dashboard-pr.md" <<'EOF'
           Refresh measured inputs and regenerate both quality dashboards for #298.
 
@@ -87,4 +116,15 @@ jobs:
           other workflows. Run the remaining required checks before merging.
           This PR requires review and merge; it does not deploy or auto-merge.
           EOF
-          gh pr create --base main --head "$REFRESH_BRANCH" --title 'docs: refresh quality dashboard evidence (#298)' --body-file "$RUNNER_TEMP/dashboard-pr.md"
+          if gh pr create --base main --head "$REFRESH_BRANCH" --title 'docs: refresh quality dashboard evidence (#298)' --body-file "$RUNNER_TEMP/dashboard-pr.md"; then
+            retained=true
+          else
+            status=$?
+            echo "::error::PR creation failed. If repository policy blocked it, the owner must enable Settings → Actions → General → Allow GitHub Actions to create and approve pull requests, subject to organization restrictions."
+            {
+              echo "PR creation failed for $REFRESH_BRANCH (exit $status). See the gh error in the step log."
+              echo "If repository policy blocked it, the owner must enable Settings → Actions → General → Allow GitHub Actions to create and approve pull requests, subject to organization restrictions."
+              echo "Proposed evidence and pages remain available in this run artifact. Refs #609."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi

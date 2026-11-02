@@ -289,3 +289,135 @@ def test_workflow_validates_bot_updates_without_recursive_ci():
         assert required in scripts
     assert "--force" not in scripts
     assert "--body-file" in scripts
+
+
+@pytest.mark.parametrize(
+    "scenario,status,deleted,summary",
+    [
+        ("policy", 23, True, "Allow GitHub Actions to create and approve pull requests"),
+        ("transport", 23, True, "PR creation failed"),
+        ("success", 0, False, ""),
+        ("pending", 0, False, "already open"),
+        ("clean", 0, False, "No dashboard changes"),
+        ("commit-failure", 19, False, ""),
+        ("push-failure", 19, False, ""),
+        ("pr-exists", 23, False, "already has a PR"),
+        ("lookup-failure", 23, False, "could not be safely completed"),
+        ("delete-failure", 23, True, "Manual cleanup required"),
+    ],
+)
+def test_workflow_proposal_cleanup(tmp_path, scenario, status, deleted, summary):
+    workflow = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[2] / ".github/workflows/quality-dashboard-refresh.yml"
+        ).read_text()
+    )
+    script = next(
+        step["run"]
+        for step in workflow["jobs"]["refresh"]["steps"]
+        if step.get("name") == "Propose reviewed update"
+    )
+    # An isolated PATH and environment prevent real git, gh, or credentials being used.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = (
+        f"#!{sys.executable}\n"
+        + """\
+import json
+import os
+import sys
+from pathlib import Path
+
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+scenario = os.environ["SCENARIO"]
+with open(os.environ["COMMAND_LOG"], "a") as log:
+    log.write(json.dumps([name, *args]) + "\\n")
+if name == "cat":
+    sys.stdout.write(sys.stdin.read())
+elif name == "git":
+    if args[:3] == ["diff", "--cached", "--quiet"]:
+        sys.exit(0 if scenario == "clean" else 1)
+    if args[0] == "commit" and scenario == "commit-failure":
+        sys.exit(19)
+    if args == ["push", "origin", os.environ["REFRESH_BRANCH"]] and scenario == "push-failure":
+        sys.exit(19)
+    if "--delete" in args and scenario == "delete-failure":
+        sys.exit(31)
+elif name == "gh":
+    if args[:2] == ["pr", "create"]:
+        if scenario != "success":
+            print("GitHub Actions is not permitted to create or approve pull requests."
+                  if scenario == "policy" else "API transport failed", file=sys.stderr)
+            sys.exit(23)
+    elif args[:2] == ["pr", "list"]:
+        if "--head" in args:
+            if scenario == "lookup-failure":
+                print("PR lookup failed", file=sys.stderr)
+                sys.exit(29)
+            print("1" if scenario == "pr-exists" else "0")
+        else:
+            print("1" if scenario == "pending" else "0")
+    else:
+        sys.exit("Unexpected gh command")
+else:
+    sys.exit("Unexpected executable")
+"""
+    )
+    for name in ("git", "gh", "cat"):
+        executable = bin_dir / name
+        executable.write_text(stub)
+        executable.chmod(0o755)
+    summary_path = tmp_path / "summary"
+    summary_path.touch()
+    command_log = tmp_path / "commands.jsonl"
+    branch = "automation/quality-dashboard-123-1"
+    result = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-c", script],
+        cwd=tmp_path,
+        env={
+            "PATH": str(bin_dir),
+            "HOME": str(tmp_path),
+            "REFRESH_BRANCH": branch,
+            "GITHUB_STEP_SUMMARY": str(summary_path),
+            "RUNNER_TEMP": str(tmp_path),
+            "COMMAND_LOG": str(command_log),
+            "SCENARIO": scenario,
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    commands = [json.loads(line) for line in command_log.read_text().splitlines()]
+    assert result.returncode == status, result.stderr
+    assert summary in summary_path.read_text()
+    deletions = [cmd for cmd in commands if cmd[:2] == ["git", "push"] and "--delete" in cmd]
+    assert deletions == ([["git", "push", "origin", "--delete", branch]] if deleted else [])
+    if scenario == "success":
+        assert ["git", "push", "origin", branch] in commands
+        assert any(cmd[:3] == ["gh", "pr", "create"] for cmd in commands)
+        assert not any("--head" in cmd for cmd in commands if cmd[:3] == ["gh", "pr", "list"])
+    if scenario == "pending":
+        assert not any(cmd[:2] == ["git", "switch"] for cmd in commands)
+    if scenario in ("pending", "clean", "commit-failure", "push-failure"):
+        assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in commands)
+    if scenario in ("pending", "clean", "commit-failure"):
+        assert not any(cmd[:2] == ["git", "push"] for cmd in commands)
+    if status == 23:
+        lookup = next(
+            cmd for cmd in commands if cmd[:3] == ["gh", "pr", "list"] and "--head" in cmd
+        )
+        assert lookup[lookup.index("--head") + 1] == branch
+        assert lookup[lookup.index("--state") + 1] == "all"
+        assert "::error::PR creation failed" in result.stdout
+        assert (
+            "Allow GitHub Actions to create and approve pull requests" in summary_path.read_text()
+        )
+        assert branch in summary_path.read_text()
+        assert (
+            "not permitted" if scenario == "policy" else "API transport failed"
+        ) in result.stderr
+    if scenario == "lookup-failure":
+        assert "PR lookup failed" in result.stderr
+    if scenario == "delete-failure":
+        assert f"::error::Manual cleanup required for branch {branch}" in result.stdout
